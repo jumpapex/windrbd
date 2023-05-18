@@ -1,5 +1,6 @@
 [submodule "drbd"]
         path = drbd
-        url = https://github.com/LINBIT/drbd-9.0.git
+        url = https://github.com/jumpapex/drbd.git
+        branch = paul
         update = rebase
         fetchRecurseSubmodules = true

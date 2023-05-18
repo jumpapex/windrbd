@@ -306,6 +306,8 @@ TODO: should be:
 #define U32_MAX		((u32)~0U)
 #define S32_MAX		((s32)(U32_MAX>>1))
 
+#define PRIu64 "I64u"
+
 enum km_type {
 	KM_BOUNCE_READ,
 	KM_SKB_SUNRPC_DATA,

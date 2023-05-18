@@ -1667,6 +1667,7 @@ static void windrbd_bio_finished(struct bio * bio)
 	bio_put(bio);
 }
 
+
 static void windrbd_internal_io_finished(struct bio * bio)
 {
 	KeSetEvent(bio->bi_io_finished_event, 0, FALSE);
@@ -1929,6 +1930,317 @@ static NTSTATUS make_drbd_requests_from_irp(struct _IRP *irp, struct block_devic
 	rw = s->MajorFunction == IRP_MJ_WRITE ? WRITE : READ;
 
 	return windrbd_make_drbd_requests(irp, dev, buffer, total_size, sector, rw);
+}
+
+static void windrbd_bio_dummy_write_finished(struct bio* bio)
+{
+	PIRP irp = bio->bi_upper_irp;
+	int i;
+	NTSTATUS status;
+	int error = blk_status_to_errno(bio->bi_status);
+#if 0
+	if (irp == NULL) {
+		printk("Internal error: irp is NULL in bio_finished, this should not happen.");
+		return;
+	}
+#endif
+	// printk("1 error is %d bio is %p\n", error, bio);
+	// printk("bio->bi_vcnt is %d\n", bio->bi_vcnt);
+	status = STATUS_SUCCESS;
+
+	if (error == 0) {
+		if (bio_data_dir(bio) == READ) {
+			if (!bio->bi_common_data->bc_device_failed && bio->bi_upper_irp && bio->bi_upper_irp->MdlAddress) {
+				char* user_buffer = bio->bi_upper_irp_buffer;
+				if (user_buffer != NULL) {
+					int offset;
+
+					offset = bio->bi_mdl_offset;
+					for (i = 0; i < bio->bi_vcnt; i++) {
+						RtlCopyMemory(user_buffer + offset, ((char*)bio->bi_io_vec[i].bv_page->addr) + bio->bi_io_vec[i].bv_offset, bio->bi_io_vec[i].bv_len);
+						offset += bio->bi_io_vec[i].bv_len;
+					}
+				}
+				else {
+					printk(KERN_WARNING "MmGetSystemAddressForMdlSafe returned NULL\n");
+					status = STATUS_INVALID_PARAMETER;
+				}
+			}
+		}
+	}
+	else {
+		printk(KERN_ERR "I/O failed with %d\n", error);
+
+		/* This translates to error 55
+		 * (ERROR_DEV_NOT_EXIST: The specified network
+		 * resource or device is no longer available.
+		 * which is quite close to what we mean. Also
+		 * under Windows 10 / Server 2016?
+		 */
+
+		status = STATUS_DEVICE_DOES_NOT_EXIST;
+	}
+	// printk("2\n");
+	if (bio_data_dir(bio) == READ) {
+		// printk("free page contents %p ...\n", bio);
+		for (i = 0; i < bio->bi_vcnt; i++) {
+			// printk("free page contents bio->bi_io_vec[i].bv_page->addr is %p i is %d ...\n", bio->bi_io_vec[i].bv_page->addr, i);
+			put_page(bio->bi_io_vec[i].bv_page);
+			//			kfree(bio->bi_io_vec[i].bv_page->addr);
+		}
+	}
+
+#if 0
+	/* Set addr to NULL so that a free_page() later on
+	 * (on put_page() at the end of this function) will
+	 * not free the page again (or free an invalid address).
+	 */
+
+	for (i = 0; i < bio->bi_vcnt; i++) {
+		bio->bi_io_vec[i].bv_page->addr = NULL;
+	}
+#endif
+
+	KIRQL flags;
+
+	/* TODO: later when we patch out the extra copy
+	 * on read, this also can be done much easier.
+	 */
+
+	int total_num_completed = bio->bi_common_data->bc_num_requests;
+	size_t total_size = bio->bi_common_data->bc_total_size;
+
+	spin_lock_irqsave(&bio->bi_common_data->bc_device_failed_lock, flags);
+	int num_completed = atomic_inc_return(&bio->bi_common_data->bc_num_completed);
+	int device_failed = bio->bi_common_data->bc_device_failed;
+	if (status != STATUS_SUCCESS)
+		bio->bi_common_data->bc_device_failed = 1;
+	spin_unlock_irqrestore(&bio->bi_common_data->bc_device_failed_lock, flags);
+
+	/* Do not access bio->bi_common_data here as it might be
+	 * already freed.
+	 */
+#if 0
+	if (num_completed == total_num_completed) {
+		if (status == STATUS_SUCCESS)
+			irp->IoStatus.Information = total_size;
+		else
+			/* Windows documentation states that this
+			 * should be set to 0 if non-success error
+			 * code is returned (even if we already
+			 * successfully read/wrote data).
+			 */
+			irp->IoStatus.Information = 0;
+
+		irp->IoStatus.Status = status;
+
+#if 0
+		/* do not complete? */
+		if (about_to_remove_irp(irp, bio->bi_bdev) != 0)
+			printk("XXX IRP %p not registered, let's see what happens\n", irp);
+
+		//		spin_lock_irqsave(&bio->bi_bdev->complete_request_spinlock, flags);
+#endif
+//		kthread_run(io_complete_thread, irp, "complete-irp");
+
+		if (bio_data_dir(bio) == WRITE) {
+			DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, "windrbd_bio_finished: to complete WRITE at %" PRIu64 ", size: %u\n", bio->bi_iter.bi_sector, total_size >> 9);
+			/* Signal free_mdl thread that it should
+			 * complete the IRP.
+			 */
+			bio->delayed_io_completion = true;
+		}
+		else
+			IoCompleteRequest(irp, status != STATUS_SUCCESS ? IO_NO_INCREMENT : IO_DISK_INCREMENT);
+#if 0
+		if (!irp_already_completed(irp))
+			IoCompleteRequest(irp, IO_NO_INCREMENT);
+
+		if (really_remove_irp(irp, bio->bi_bdev) != 0)
+			printk("XXX IRP %p not registered, let's see what happens\n", irp);
+
+		// printk("out of IoCompleteRequest irp is %p\n", irp);
+		//		spin_unlock_irqrestore(&bio->bi_bdev->complete_request_spinlock, flags);
+		printk("XXX out of IoCompleteRequest irp is %p sector is %lld\n", irp, bio->bi_iter.bi_sector);
+#endif
+
+		kfree(bio->bi_common_data);
+	}
+	IoReleaseRemoveLock(&bio->bi_bdev->ref->w_remove_lock, NULL);
+
+	/* TODO: solves memory leak? */
+	/* Where is the get_page for this? */
+	if (bio_data_dir(bio) == WRITE) {
+		for (i = 0; i < bio->bi_vcnt; i++)
+			put_page(bio->bi_io_vec[i].bv_page);
+	}
+#else
+	kfree(bio->bi_common_data);
+#endif
+	bio_put(bio);
+}
+
+NTSTATUS windrbd_make_dummy_drbd_write_request(struct block_device* dev, unsigned int total_size, sector_t sector, struct bio** _bio)
+{
+	struct _IRP* irp = NULL;
+	char* buffer = NULL;
+	unsigned long rw = WRITE;
+	struct bio* bio;
+
+	int b;
+	struct bio_collection* common_data;
+
+	// printk("1\n");
+	if (rw == WRITE && dev->drbd_device->resource->role[NOW] != R_PRIMARY) {
+		printk("Attempt to write when not Primary\n");
+		return STATUS_INVALID_PARAMETER;
+	}
+	if (sector * dev->bd_block_size >= dev->d_size) {
+		dbg("Attempt to read past the end of the device: dev->bd_block_size is %d sector is %lld (%llu) byte offset is %lld (%llu) dev->d_size is %lld rw is %s\n", dev->bd_block_size, sector, sector, sector * dev->bd_block_size, sector * dev->bd_block_size, dev->d_size, rw == WRITE ? "WRITE" : "READ");
+		return STATUS_INVALID_PARAMETER;
+	}
+	if (sector * dev->bd_block_size + total_size > dev->d_size) {
+		dbg("Attempt to read past the end of the device, request shortened\n");
+		total_size = dev->d_size - sector * dev->bd_block_size;
+	}
+	if (total_size == 0) {
+		printk("I/O request of size 0.\n");
+		return STATUS_INVALID_PARAMETER;
+	}
+#if 0
+	if (buffer == NULL) {
+		printk("I/O buffer (from MmGetSystemAddressForMdlSafe()) is NULL\n");
+		return STATUS_INSUFFICIENT_RESOURCES;
+	}
+#endif
+	int bio_count = (total_size - 1) / MAX_BIO_SIZE + 1;
+	int this_bio_size;
+	int last_bio_size = total_size % MAX_BIO_SIZE;
+	if (last_bio_size == 0)
+		last_bio_size = MAX_BIO_SIZE;
+
+	common_data = kzalloc(sizeof(*common_data), 0, 'DRBD');
+	if (common_data == NULL) {
+		printk("Cannot allocate common data.\n");
+		return STATUS_INSUFFICIENT_RESOURCES;
+	}
+	atomic_set(&common_data->bc_num_completed, 0);
+	common_data->bc_total_size = total_size;
+	common_data->bc_num_requests = bio_count;
+	common_data->bc_device_failed = 0;
+	spin_lock_init(&common_data->bc_device_failed_lock);
+
+	/* Do this before windrbd_bio_finished might be called, else
+	 * this could produce a blue screen.
+	 */
+
+#if 0
+	IoMarkIrpPending(irp);
+#endif
+
+	for (b = 0; b < bio_count; b++) {
+		this_bio_size = (b == bio_count - 1) ? last_bio_size : MAX_BIO_SIZE;
+
+		bio = bio_alloc(GFP_NOIO, 1, 'DBRD');
+		if (bio == NULL) {
+			printk("Couldn't allocate bio.\n");
+			return STATUS_INSUFFICIENT_RESOURCES;
+		}
+		bio->bi_opf = (rw == WRITE ? REQ_OP_WRITE : REQ_OP_READ);
+		bio->bi_bdev = dev;
+		bio->bi_max_vecs = 1;
+		bio->bi_vcnt = 0;
+		bio->bi_paged_memory = (bio_data_dir(bio) == WRITE);
+		//		bio->force_mdl_unlock = 1;	/* TODO: ?? */
+		bio->bi_iter.bi_size = this_bio_size;
+		bio->bi_iter.bi_sector = sector + b * MAX_BIO_SIZE / dev->bd_block_size;
+		bio->bi_upper_irp_buffer = buffer;
+		bio->bi_mdl_offset = (unsigned long long)b * MAX_BIO_SIZE;
+		bio->bi_common_data = common_data;
+#if 0
+		dbg("%s sector: %d total_size: %d\n", rw == WRITE ? "WRITE" : "READ", sector, total_size);
+
+		bio->bi_io_vec[0].bv_page = kzalloc(sizeof(struct page), 0, 'DRBD');
+		if (bio->bi_io_vec[0].bv_page == NULL) {
+			printk("Couldn't allocate page.\n");
+			return STATUS_INSUFFICIENT_RESOURCES; /* TODO: cleanup */
+		}
+
+		bio->bi_io_vec[0].bv_len = this_bio_size;
+		bio->bi_io_vec[0].bv_page->size = this_bio_size;
+		kref_init(&bio->bi_io_vec[0].bv_page->kref);
+
+		/* Corresponding put_page in the free-mdl
+		 * thread (free_bios_thread_fn())
+		 */
+		get_page(bio->bi_io_vec[0].bv_page);
+
+
+		/*
+		 * TODO: eventually we want to make READ requests work without the
+		 *	 intermediate buffer and the extra copy.
+		 */
+
+
+		if (bio_data_dir(bio) == READ)
+			bio->bi_io_vec[0].bv_page->addr = kmalloc(this_bio_size, 0, 'DRBD');
+		else {
+			bio->bi_io_vec[0].bv_page->addr = buffer + bio->bi_mdl_offset;
+			bio->bi_io_vec[0].bv_page->is_system_buffer = 1;
+		}
+
+		/* TODO: fault inject here. */
+		if (bio->bi_io_vec[0].bv_page->addr == NULL) {
+			printk("Couldn't allocate temp buffer for read.\n");
+			return STATUS_INSUFFICIENT_RESOURCES; /* TODO: cleanup */
+		}
+
+		bio->bi_io_vec[0].bv_offset = 0;
+#endif
+		bio->bi_end_io = windrbd_bio_dummy_write_finished;
+		bio->bi_upper_irp = irp;
+
+		// dbg("bio: %p bio->bi_io_vec[0].bv_page->addr: %p bio->bi_io_vec[0].bv_len: %d bio->bi_io_vec[0].bv_offset: %d\n", bio, bio->bi_io_vec[0].bv_page->addr, bio->bi_io_vec[0].bv_len, bio->bi_io_vec[0].bv_offset);
+		dbg("bio->bi_iter.bi_size: %d bio->bi_iter.bi_sector: %d bio->bi_mdl_offset: %d\n", bio->bi_iter.bi_size, bio->bi_iter.bi_sector, bio->bi_mdl_offset);
+
+#if 0
+		if (b == 0) {
+			// printk("into drbd_make_request irp is %p\n", irp);
+			if (add_irp(irp, bio->bi_bdev, bio->bi_iter.bi_sector) != 0)
+				printk("IRP already there?\n");
+		}
+#endif
+#if 0
+		if (dev->io_workqueue == NULL) {
+			printk("Warning: dev->io_workqueue is NULL on I/O handler.\n");
+			return -EINVAL;	/* TODO: cleanup */
+		}
+		part_stat_add(dev, sectors[bio_data_dir(bio) == READ ? STAT_READ : STAT_WRITE], this_bio_size / 512);
+		/* drbd_make_request(dev->drbd_device->rq_queue, bio); */
+		struct io_request* ioreq;
+
+		ioreq = kzalloc(sizeof(*ioreq), 0, 'DRBD');
+		if (ioreq == NULL) {
+			return -ENOMEM;	/* TODO: cleanup */
+		}
+		INIT_WORK(&ioreq->w, drbd_make_request_work);
+
+		/* No need for refcount. workqueue is flushed
+		 * and destroyed when becoming secondary, so
+		 * no in-flight requests on drbdadm down.
+		 */
+		ioreq->drbd_device = dev->drbd_device;
+		ioreq->bio = bio;
+
+		// printk("2\n");
+		queue_work(dev->io_workqueue, &ioreq->w);
+		// printk("3\n");
+#endif
+		*_bio = bio;
+		break;
+	}
+
+	return STATUS_SUCCESS;
 }
 
 static NTSTATUS windrbd_io(struct _DEVICE_OBJECT *device, struct _IRP *irp)
